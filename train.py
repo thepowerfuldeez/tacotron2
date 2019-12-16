@@ -1,10 +1,12 @@
 import argparse
 import matplotlib.pyplot as plt
 import numpy as np
+import time
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
+from collections import OrderedDict
 import nltk
 nltk.download('punkt')
 
@@ -21,7 +23,8 @@ def train(model, loader, opt, local_rank=0, iteration=0, log_every=100, fp16=Fal
         mel = mel.to("cuda", non_blocking=True)
         stop_target = stop_target.to("cuda", non_blocking=True)
         iteration += 1
-
+        
+        start = time.time()
         opt.zero_grad()
         mel_pred, mel_pred_postnet, stop_predictions, alignment = model(text, input_lengths, mel)
         mel_loss = F.mse_loss(mel_pred, mel)
@@ -30,10 +33,11 @@ def train(model, loader, opt, local_rank=0, iteration=0, log_every=100, fp16=Fal
         
         loss = mel_loss + mel_postnet_loss + stop_loss
         metric_values.append(loss.item())
+        end = time.time()
         
         # print only if it's first device (local_rank == 0)
         if iteration % log_every == 0 and local_rank == 0:
-            print(f"{iteration}, mel_loss.item()={mel_loss.item():.2f}, mel_postnet_loss.item()={mel_postnet_loss.item():.2f}, stop_loss.item()={stop_loss.item():.3f}")
+            print(f"{iteration}, mel_loss.item()={mel_loss.item():.2f}, mel_postnet_loss.item()={mel_postnet_loss.item():.2f}, stop_loss.item()={stop_loss.item():.3f}, {end-start:.2f} s.")
         if fp16:
             with amp.scale_loss(loss, opt) as scaled_loss:
                 scaled_loss.backward()
@@ -55,10 +59,11 @@ def test_alignment(batch, model):
     plt.show()
 
 
-def save_checkpoint(model, iteration, out_path, fp16):
+def save_checkpoint(model, iteration, best_metric, out_path, fp16):
     checkpoint = {
         "iteration": iteration,
-        "state_dict": model.state_dict(),
+        "best_metric": best_metric,
+        "state_dict": model.state_dict()
     }
     if fp16:
         checkpoint.update({"amp": amp.state_dict()})
@@ -69,7 +74,13 @@ def load_checkpoint(checkpoint_path, model, fp16, local_rank):
     # we should load checkpoint on appropriate gpu device, derived from local_rank, use lambda (example from
     # https://github.com/NVIDIA/apex/blob/master/examples/imagenet/main_amp.py )
     checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage.cuda(local_rank))
-    model.load_state_dict(checkpoint['state_dict'])
+    state_dict = checkpoint['state_dict'] 
+    if "module." in list(state_dict.keys())[0]:
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            new_state_dict[k[len("module."):]] = v
+        state_dict = new_state_dict
+    model.load_state_dict(state_dict)
     if fp16 and 'amp' in checkpoint:
         amp.load_state_dict(checkpoint['amp'])
     return checkpoint['iteration'], checkpoint['best_metric']
@@ -110,12 +121,22 @@ if __name__ == "__main__":
 
     model = Model(fp16=fp16)
     model = model.to(local_rank)  # move model to appropriate gpu when using distributed training
+    opt = torch.optim.Adam(model.parameters())
+    
+    # order is important: cast to fp16 first, load fp16 checkpoint (with amp weights), apply DDP, apply sync_bn
+    # as stated here: https://github.com/NVIDIA/apex/tree/master/examples/imagenet
+    if fp16:
+        # Initialization with apex
+        from apex import amp
+
+        opt_level = 'O2'
+        model, opt = amp.initialize(model, opt, opt_level=opt_level)
+    
     iteration = 0
     best_metric = 1e3
     if checkpoint:
         iteration, best_metric = load_checkpoint(checkpoint, model, fp16, local_rank)
         print(f"resuming from {iteration} iteration")
-    opt = torch.optim.Adam(model.parameters())
 
     sampler = None
     if args.distributed:
@@ -128,13 +149,6 @@ if __name__ == "__main__":
         # run with python -m torch.distributed.launch --nproc_per_node=NUM_GPUS train.py
 
         sampler = torch.utils.data.distributed.DistributedSampler(ds)
-    
-    if fp16:
-        # Initialization with apex
-        from apex import amp
-
-        opt_level = 'O2'
-        model, opt = amp.initialize(model, opt, opt_level=opt_level)
 
     if args.sync_bn:
         from apex.parallel import convert_syncbn_model
@@ -155,6 +169,6 @@ if __name__ == "__main__":
         if local_rank == 0:
             if avg_metric < best_metric:
                 best_metric = avg_metric
-                save_checkpoint(model, iteration, checkpoints_path.joinpath("model_best.pth"), fp16)
+                save_checkpoint(model, iteration, best_metric, checkpoints_path.joinpath("model_best.pth"), fp16)
             if epoch % 10 == 0:
-                save_checkpoint(model, iteration, checkpoints_path.joinpath("model_last.pth"), fp16)
+                save_checkpoint(model, iteration, best_metric, checkpoints_path.joinpath("model_last.pth"), fp16)
