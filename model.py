@@ -36,6 +36,10 @@ class Encoder(nn.Module):
         features = self.conv_layers(embedding)
         features = features.transpose(1, 2)
         features = nn.utils.rnn.pack_padded_sequence(features, input_lengths, batch_first=True, enforce_sorted=True)
+        # when training on multiple gpu, you probably need to flatten params of rnn to ensure they are on the one
+        # gpu after splitting
+        # more: https://discuss.pytorch.org/t/why-do-we-need-flatten-parameters-when-using-rnn-with-dataparallel/46506/2
+        # self.rnn.flatten_parameters()
         # compute rnn features
         features, _ = self.rnn(features)
         features = nn.utils.rnn.pad_packed_sequence(features, batch_first=True, total_length=input_lengths[0])[0]
@@ -161,6 +165,9 @@ class Decoder(nn.Module):
             hidden = self.init_hidden(B, device=encoder_outputs.device)
         decoder_input = self.prenet(mel_input)
         attention_context, attention_weights = self.attention(decoder_input.squeeze(1), hidden[0][0], encoder_outputs)
+        # when training on multiple gpu, you probably need to flatten params of rnn to ensure they are on the one
+        # gpu after splitting
+        # self.decoder_rnn.flatten_parameters()
         output, hidden = self.decoder_rnn(torch.cat((decoder_input, attention_context), -1), hidden)
         mel_frame = self.linear_target(torch.cat((output, attention_context), -1))
         stop_prediction = self.linear_stop_pred(torch.cat((output, attention_context), -1))
@@ -184,6 +191,24 @@ class Decoder(nn.Module):
         alignment = torch.cat(alignment, 1).transpose(1, 2)
         return mel, mel_postnet, stop_predictions, alignment
 
+    def inference(self, encoder_outputs, stop_threshold=0.5):
+        """Auto-regressive inference (with no target mel)"""
+        mel_frames, alignment = [], []
+        mel_frame, hidden = None, None
+        i = 0
+        while i < MAX_LENGTH:
+            mel_frame, hidden, stop_prediction, attention_weights = self.decode(mel_frame, hidden, encoder_outputs)
+            mel_frames.append(mel_frame)
+            alignment.append(attention_weights)
+            if stop_prediction[0].item() > stop_threshold:
+                # predicted end of inference
+                break
+            i += 1
+        mel = torch.cat(mel_frames, 1).transpose(1, 2)
+        mel_postnet = mel + self.postnet(mel)
+        alignment = torch.cat(alignment, 1).transpose(1, 2)
+        return mel_postnet, alignment
+
 
 class Model(nn.Module):
     """Tacotron2 model from https://arxiv.org/abs/1712.05884 (except Attention part for now)"""
@@ -198,3 +223,9 @@ class Model(nn.Module):
         encoder_outputs = self.encoder(x, input_lengths)
         mel, mel_postnet, stop_predictions, alignment = self.decoder(encoder_outputs, mel_target)
         return mel, mel_postnet, stop_predictions, alignment
+
+    def inference(self, x):
+        with torch.no_grad():
+            encoder_outputs = self.encoder(x, torch.tensor([len(x[0])], device=x.device))
+            mel_postnet, alignment = self.decoder.inference(encoder_outputs)
+        return mel_postnet, alignment

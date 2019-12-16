@@ -3,3 +3,5 @@ inflect
 torch
 g2p_en
 numpy
+matplotlib
+tqdm
