@@ -126,11 +126,12 @@ class Decoder(nn.Module):
     Teacher-forcing: treat ground-truth spectrogram frames into rnn
     instead of last predicted frame to improve stability of training."""
 
-    def __init__(self, prenet_dim=256, postnet_dim=512, encoder_rnn_size=512, hidden_size=1024):
+    def __init__(self, prenet_dim=256, postnet_dim=512, encoder_rnn_size=512, hidden_size=1024, fp16=False):
         super().__init__()
         # as we simply weigh different parts of encoder outputs
         attention_context_size = encoder_rnn_size
         self.hidden_size = hidden_size
+        self.fp16 = fp16
 
         self.attention = Attention()
         self.mel_channels = 80
@@ -145,14 +146,24 @@ class Decoder(nn.Module):
         self.linear_stop_pred = nn.Linear(hidden_size + attention_context_size, 1)
         self.postnet = Postnet(postnet_dim)
 
-    def init_hidden(self, batch_size, device="cpu"):
+    def init_hidden(self, batch_size, device="cpu", fp16=False):
         """Initialize hidden rnn state with tuple of zeros"""
-        return tuple(torch.zeros(self.decoder_n_layers, batch_size, self.hidden_size, device=device)
-                     for _ in range(self.decoder_n_layers))
+#         return tuple(torch.zeros(self.decoder_n_layers, batch_size, self.hidden_size, device=device)
+#                      for _ in range(self.decoder_n_layers))
+        hidden = tuple(torch.zeros(self.decoder_n_layers, batch_size, self.hidden_size, device=device)
+                       for _ in range(self.decoder_n_layers))
+        if fp16:
+            hidden = tuple([h.half() for h in hidden])
+        return hidden
+                     
 
-    def init_mel_input(self, batch_size, device="cpu"):
+    def init_mel_input(self, batch_size, device="cpu", fp16=False):
         """Initialize mel_input with zeros"""
-        return torch.zeros(batch_size, 1, self.mel_channels, device=device)
+#         return torch.zeros(batch_size, 1, self.mel_channels, device=device)
+        mel_input = torch.zeros(batch_size, 1, self.mel_channels, device=device)
+        if fp16:
+            mel_input = mel_input.half()
+        return mel_input
 
     def decode(self, mel_input, hidden, encoder_outputs):
         """Decode one mel_input frame to predict next frame using hidden rnn state
@@ -160,9 +171,9 @@ class Decoder(nn.Module):
         B = encoder_outputs.size(0)
 
         if mel_input is None:
-            mel_input = self.init_mel_input(B, device=encoder_outputs.device)
+            mel_input = self.init_mel_input(B, device=encoder_outputs.device, fp16=self.fp16)
         if hidden is None:
-            hidden = self.init_hidden(B, device=encoder_outputs.device)
+            hidden = self.init_hidden(B, device=encoder_outputs.device, fp16=self.fp16)
         decoder_input = self.prenet(mel_input)
         attention_context, attention_weights = self.attention(decoder_input.squeeze(1), hidden[0][0], encoder_outputs)
         # when training on multiple gpu, you probably need to flatten params of rnn to ensure they are on the one
@@ -213,11 +224,11 @@ class Decoder(nn.Module):
 class Model(nn.Module):
     """Tacotron2 model from https://arxiv.org/abs/1712.05884 (except Attention part for now)"""
 
-    def __init__(self, n_symbols=100, pad_idx=0):
+    def __init__(self, n_symbols=100, pad_idx=0, fp16=False):
         super().__init__()
 
         self.encoder = Encoder(n_symbols, pad_idx)
-        self.decoder = Decoder()
+        self.decoder = Decoder(fp16=fp16)
 
     def forward(self, x, input_lengths, mel_target):
         encoder_outputs = self.encoder(x, input_lengths)

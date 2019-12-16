@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
+import nltk
+nltk.download('punkt')
 
 from model import Model
 from data import TTSDataset, TTSCollate
@@ -25,7 +27,7 @@ def train(model, loader, opt, device="cuda", iteration=0, log_every=100, fp16=Fa
         mel_postnet_loss = F.mse_loss(mel_pred_postnet, mel)
         stop_loss = F.binary_cross_entropy(stop_predictions, stop_target)
         if iteration % log_every == 0:
-            print(f"{iteration}, {mel_loss.item()=:.2f}, {mel_postnet_loss.item()=:.2f}, {stop_loss.item()=:.3f}")
+            print(f"{iteration}, mel_loss.item()={mel_loss.item():.2f}, mel_postnet_loss.item()={mel_postnet_loss.item():.2f}, stop_loss.item()={stop_loss.item():.3f}")
         loss = mel_loss + mel_postnet_loss + stop_loss
         min_metric = min(min_metric, loss.item())
         if fp16:
@@ -99,7 +101,7 @@ if __name__ == "__main__":
     save_every = args.save_every
     fp16 = args.fp16
 
-    model = Model()
+    model = Model(fp16=fp16)
     model = model.to(device)
     iteration = 0
     if checkpoint:
@@ -111,7 +113,7 @@ if __name__ == "__main__":
         from apex import amp
 
         opt_level = 'O2'
-        model, opt = amp.initialize(model, optimizer, opt_level=opt_level)
+        model, opt = amp.initialize(model, opt, opt_level=opt_level)
 
     sampler = None
     if args.distributed:
