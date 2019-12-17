@@ -216,7 +216,7 @@ def main():
     torch.backends.cudnn.enabled = True
     exp_dir = Path("experiments").joinpath(exp_name)
     exp_dir.mkdir(exist_ok=True)
-    writer = SummaryWriter(exp_dir)
+    writer = SummaryWriter(str(exp_dir), flush_secs=30)
     with exp_dir.joinpath('commandline_args.txt').open('w') as f:
         json.dump(args.__dict__, f, indent=2)
 
