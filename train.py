@@ -4,9 +4,6 @@ import numpy as np
 import time
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
-import os
-from multiprocessing import cpu_count
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from pathlib import Path
@@ -19,30 +16,20 @@ nltk.download('punkt')
 
 from model import Model
 from data import TTSDataset, TTSCollate
+from distributed import setup_distributed, apply_gradient_allreduce, cleanup_distributed
 
 
-def setup_distributed(rank, world_size):
-    """Setup process group for distributed training"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    os.environ['OMP_NUM_THREADS'] = str(cpu_count() // torch.cuda.device_count())
-
-    # initialize the process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-
-    # Explicitly setting seed to make sure that models created in two processes
-    # start from same random weights and biases.
-    torch.manual_seed(42)
-
-
-def cleanup_distributed():
-    dist.destroy_process_group()
+def reduce_tensor(tensor, n_gpus):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.reduce_op.SUM)
+    rt /= n_gpus
+    return rt
     
 
-def setup_model(distributed, rank, world_size, checkpoint, fp16, sync_bn):
+def setup_model(distributed, rank, world_size, group_name, checkpoint, fp16, sync_bn):
     """Create model, cast to fp16 if needed, load checkpoint, apply DDP and sync_bn if needed"""
-    model = Model(fp16=fp16)
     torch.cuda.set_device(rank)
+    model = Model(fp16=fp16)
     model = model.to(rank)  # move model to appropriate gpu when using distributed training
     opt = torch.optim.Adam(model.parameters())
     
@@ -61,8 +48,8 @@ def setup_model(distributed, rank, world_size, checkpoint, fp16, sync_bn):
 
     if distributed:        
         # set default .to('cuda') behavior to current local rank
-        setup_distributed(rank, world_size)
-        model = DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=True)
+        setup_distributed(rank, world_size, group_name)
+        model = apply_gradient_allreduce(model)
         # run with python -m torch.distributed.launch --nproc_per_node=NUM_GPUS train.py
 
     if sync_bn:
@@ -74,9 +61,12 @@ def setup_model(distributed, rank, world_size, checkpoint, fp16, sync_bn):
     return model, opt, iteration, best_metric
 
 
-def train(model, loader, opt, rank=0, iteration=0, log_every=100, fp16=False):
+def train(model, loader, opt, rank=0, iteration=0, log_every=100, fp16=False, distributed=False):
     """Train loop for one epoch"""
-    torch.cuda.set_device(rank)
+    # Explicitly setting seed to make sure that models created in two processes
+    # start from same random weights and biases.
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
     metric_values = []
     for text, input_lengths, mel, stop_target in loader:
         text = text.to("cuda", non_blocking=True)
@@ -93,18 +83,31 @@ def train(model, loader, opt, rank=0, iteration=0, log_every=100, fp16=False):
         stop_loss = F.binary_cross_entropy(stop_predictions, stop_target)
         
         loss = mel_loss + mel_postnet_loss + stop_loss
-        metric_values.append(loss.item())
-        end = time.time()
         
-        # print only if it's first device (rank == 0)
-        if iteration % log_every == 0 and rank == 0:
-            print(f"{iteration}, mel_loss.item()={mel_loss.item():.2f}, mel_postnet_loss.item()={mel_postnet_loss.item():.2f}, stop_loss.item()={stop_loss.item():.3f}, {end-start:.2f} s.")
+        if distributed:
+            loss_value = reduce_tensor(loss.data, n_gpus).item()
+        else:
+            loss_value = loss.item()
+        metric_values.append(loss_value)
+        
         if fp16:
             with amp.scale_loss(loss, opt) as scaled_loss:
                 scaled_loss.backward()
         else:
-            loss.backward()
+            loss.backward()            
+        
+        if fp16:
+            grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(opt), 1.0)
+            is_overflow = np.isnan(grad_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
         opt.step()
+        end = time.time()
+        
+        # print only if it's first device (rank == 0)
+        if iteration % log_every == 0 and rank == 0:
+            print(f"{iteration}, grad_norm={grad_norm:.3f}, mel_loss.item()={mel_loss.item():.3f}, mel_postnet_loss.item()={mel_postnet_loss.item():.3f}, stop_loss.item()={stop_loss.item():.3f}, {end-start:.2f} s.")
     return iteration, np.mean(metric_values)
 
 
@@ -144,7 +147,7 @@ def load_checkpoint(checkpoint_path, model, opt, fp16, rank):
             new_state_dict[k[len("module."):]] = v
         state_dict = new_state_dict
     model.load_state_dict(state_dict)
-#     opt.load_state_dict(checkpoint['opt'])
+    opt.load_state_dict(checkpoint['opt'])
     if fp16 and 'amp' in checkpoint:
         amp.load_state_dict(checkpoint['amp'])
     return checkpoint['iteration'], checkpoint['best_metric']
@@ -163,7 +166,8 @@ def parse_args():
 
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--distributed", help="DDP training", action="store_true")
-    p.add_argument("--local_rank", help="for DDP, default device", default=0, type=int)
+    p.add_argument("--group-name", help="Distributed group name")
+    p.add_argument("--rank", help="for DDP, default device", default=0, type=int)
     p.add_argument("--sync-bn", help="synchronized batchnorm for distributed", action="store_true")
     return p.parse_args()
 
@@ -178,30 +182,33 @@ def main():
     log_every = args.log_every
     save_every = args.save_every
     fp16 = args.fp16
-    local_rank = args.local_rank
+    rank = args.rank
     distributed = args.distributed
+    group_name = args.group_name
     
-    ds = TTSDataset(ds_path)
+    torch.backends.cudnn.enabled = True
 
     world_size = torch.cuda.device_count() * 1  # as we have only 1 node
-    model, opt, iteration, best_metric = setup_model(distributed, local_rank, world_size, checkpoint, fp16, args.sync_bn)
+    model, opt, iteration, best_metric = setup_model(distributed, rank, world_size, group_name, checkpoint, fp16, args.sync_bn)
+    
+    ds = TTSDataset(ds_path)
     sampler = None
     if distributed:
-        sampler = torch.utils.data.distributed.DistributedSampler(ds, num_replicas=world_size, rank=local_rank)
+        sampler = torch.utils.data.distributed.DistributedSampler(ds, num_replicas=world_size, rank=rank)
 
     loader = DataLoader(ds, batch_size=batch_size, collate_fn=TTSCollate(), sampler=sampler)
     for epoch in range(1, num_epochs + 1):
-        if local_rank == 0:
+        if rank == 0:
             print("epoch", epoch)
-        iteration, avg_metric = train(model, loader, opt, local_rank, iteration=iteration, log_every=log_every, fp16=fp16)
+        iteration, avg_metric = train(model, loader, opt, rank, iteration=iteration, log_every=log_every, fp16=fp16)
         # for jupyter notebook
         # if iteration % 25 == 0:
         # clear_output(True)
         # test_alignment([ds[0]], model)
-        if local_rank == 0:
+        if rank == 0:
             if avg_metric < best_metric:
                 best_metric = avg_metric
-                save_checkpoint(model, iteration, best_metric, checkpoints_path.joinpath("model_best.pth"), fp16)
+                save_checkpoint(model, opt, iteration, best_metric, checkpoints_path.joinpath("model_best.pth"), fp16)
             if epoch % save_every == 0:
                 save_checkpoint(model, opt, iteration, best_metric, checkpoints_path.joinpath("model_last.pth"), fp16)
     cleanup_distributed()
