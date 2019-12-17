@@ -179,6 +179,7 @@ def load_checkpoint(checkpoint_path, model, opt, fp16, rank):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--args", default=None, type=Path, help="Load arguments from file")
+    p.add_argument("--exp-name", default="default", help="Experiment name")
     p.add_argument("--ds-path", type=Path, help="Dataset metadata path")
     p.add_argument("--checkpoints-path", type=Path)
     p.add_argument("--checkpoint", default=None)
