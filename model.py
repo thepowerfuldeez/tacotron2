@@ -1,6 +1,8 @@
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+from text import encode_text
+import numpy as np
 
 p_dropout = 0.5
 MAX_LENGTH = 1000
@@ -232,7 +234,21 @@ class Model(nn.Module):
         return mel, mel_postnet, stop_predictions, alignment
 
     def inference(self, x):
+        device = next(self.parameters()).device
+        text_encoded = np.array([encode_text(text) for text in x])
+        input_lengths = np.array([len(it) for it in text_encoded])
+        sorted_idx = np.argsort(input_lengths)[::-1]
+
+        input_lengths = input_lengths[sorted_idx]
+        text_encoded = text_encoded[sorted_idx]
+        text_padded = torch.zeros(len(x), input_lengths[0]).long()
+        for i, l in enumerate(input_lengths):
+            text_padded[i, :l] = torch.from_numpy(text_encoded[i]).long()
+        input_lengths = torch.from_numpy(input_lengths).long()
+        input_lengths = input_lengths.to(device)
+        text_padded = text_padded.to(device)
+        
         with torch.no_grad():
-            encoder_outputs = self.encoder(x, torch.tensor([len(it) for it in x], device=x.device))
+            encoder_outputs = self.encoder(text_padded, input_lengths)
             mel_postnet, alignment = self.decoder.inference(encoder_outputs)
         return mel_postnet, alignment

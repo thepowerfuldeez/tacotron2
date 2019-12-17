@@ -21,8 +21,11 @@ from torch.utils.tensorboard import SummaryWriter
 from model import Model
 from data import TTSDataset, TTSCollate
 from distributed import setup_distributed, apply_gradient_allreduce, cleanup_distributed
-from text import encode_text
 from util import reduce_tensor, show_figure, success_rate
+
+import sys
+sys.path.append("waveglow")
+from denoiser import Denoiser
 
 
 def setup_model(
@@ -31,6 +34,7 @@ def setup_model(
         world_size: int,
         group_name: str,
         checkpoint: str,
+        learning_rate: float,
         fp16: bool,
         sync_bn: bool
 ):
@@ -38,7 +42,7 @@ def setup_model(
     torch.cuda.set_device(rank)
     model = Model(fp16=fp16)
     model = model.to(rank)  # move model to appropriate gpu when using distributed training
-    opt = torch.optim.Adam(model.parameters())
+    opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     # order is important: cast to fp16 first, load fp16 checkpoint (with amp weights), apply DDP, apply sync_bn
     # as stated here: https://github.com/NVIDIA/apex/tree/master/examples/imagenet
@@ -74,7 +78,8 @@ def train(model, train_loader, opt, writer, rank=0, iteration=0, log_every=100, 
     # start from same random weights and biases.
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
-
+    
+    np.random.seed(iteration % 42)
     # randomly choose index of loader to send images and attention to tensorboard (send only one per epoch)
     random_idx = np.random.choice(len(train_loader), 1)
     model.train()
@@ -108,8 +113,14 @@ def train(model, train_loader, opt, writer, rank=0, iteration=0, log_every=100, 
 
             print("finding right index", i, "of", random_idx)
             if i == random_idx:
-                writer.add_figure("mel_pred/train", show_figure(mel_pred_postnet.cpu().numpy()[0]), iteration)
-                writer.add_figure("alignment/train", show_figure(alignment.cpu().numpy(), origin='lower'), iteration)
+                writer.add_image("mel_pred/train", 
+                                  show_figure(mel_pred_postnet[0].float().detach().cpu().numpy()), 
+                                  iteration,
+                                  dataformats='HWC')
+                writer.add_image("alignment/train", 
+                                  show_figure(alignment[0].float().detach().cpu().numpy(), origin='lower'), 
+                                  iteration,
+                                  dataformats='HWC')
 
         if fp16:
             with amp.scale_loss(loss, opt) as scaled_loss:
@@ -138,12 +149,13 @@ def validate(
         val_loader: DataLoader,
         writer: SummaryWriter,
         iteration: int,
-        distributed: bool = False,
         waveglow_nvidia_repo_dir: Path = None,
-        waveglow_path: Path = None
+        waveglow_path: Path = None,
+        fp16: bool = False
 ):
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
+    np.random.seed(iteration % 42)
     metric_values, success_rates = [], []
     model.eval()
     start = time.time()
@@ -151,10 +163,12 @@ def validate(
     # choose random mel-spectogram and synthesize audio from it
     random_idx = np.random.choice(len(val_loader), 1)
     for i, (text, input_lengths, mel, stop_target) in enumerate(val_loader):
+        print("batch", i)
         text = text.to("cuda", non_blocking=True)
         input_lengths = input_lengths.to("cuda", non_blocking=True)
         mel = mel.to("cuda", non_blocking=True)
         stop_target = stop_target.to("cuda", non_blocking=True)
+        print("done data prep")
         with torch.no_grad():
             mel_pred, mel_pred_postnet, stop_predictions, alignment = model(text, input_lengths, mel)
             mel_loss = F.mse_loss(mel_pred, mel)
@@ -162,57 +176,75 @@ def validate(
             stop_loss = F.binary_cross_entropy(stop_predictions, stop_target)
 
             loss = mel_loss + mel_postnet_loss + stop_loss
-            if distributed:
-                n_gpus = torch.cuda.device_count()
-                loss_value = reduce_tensor(loss.data, n_gpus).item()
-            else:
-                loss_value = loss.item()
+            print("done loss computing")
+            loss_value = loss.item()
             metric_values.append(loss_value)
             success_rates.append(success_rate(alignment))
             print("finding right index", i, "of", random_idx)
             if i == random_idx:
-                mel_to_gen = mel_pred_postnet
+                mel_to_gen = mel_pred_postnet[0]
+                gen_alignment = alignment[0]
     avg_loss = np.mean(metric_values)
     avg_success_rate = np.mean(success_rates)
     writer.add_scalar('loss/validation', avg_loss, iteration)
     writer.add_scalar('success_rate/validation', avg_success_rate, iteration)
-    writer.add_figure("mel_pred/validation", show_figure(mel_pred_postnet.cpu().numpy()), iteration)
-    writer.add_figure("alignment/validation", show_figure(alignment.cpu().numpy(), origin='lower'), iteration)
+    writer.add_image("mel_pred/validation", 
+                      show_figure(mel_to_gen.float().cpu().numpy()), 
+                      iteration,
+                      dataformats='HWC')
+    writer.add_image("alignment/validation", 
+                      show_figure(gen_alignment.float().cpu().numpy(), origin='lower'), 
+                      iteration,
+                      dataformats='HWC')
     if waveglow_nvidia_repo_dir and waveglow_path:
+        print('start to audio synthesis')
         writer.add_audio("audio/validation",
-                         waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel_to_gen), iteration)
+                         waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel_to_gen[None], fp16=fp16), iteration)
     end = time.time()
     print(f"validation {iteration}, loss={loss_value:.3f}, {end - start:.2f} s.")
     return avg_loss
 
 
-def inference(model, sample_texts, writer, iteration, waveglow_nvidia_repo_dir=None, waveglow_path=None):
+def inference(model, sample_texts, writer, iteration, waveglow_nvidia_repo_dir=None, waveglow_path=None, fp16=False):
     """Perform inference on test set of only texts (no target mel provided)"""
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
-    text_encoded = [encode_text(text) for text in sample_texts]
+    model.eval()
+    start = time.time()
     with torch.no_grad():
-        mel_postnet, alignment = model.inference(text_encoded)
+        mel_postnet, alignment = model.inference(sample_texts)
+        
+    random_idx = np.random.randint(mel_postnet.size(0))
     writer.add_scalar("success_rate/inference", success_rate(alignment), iteration)
-    writer.add_figure("mel_pred/inference", show_figure(mel_postnet.cpu().numpy()), iteration)
-    writer.add_figure("alignment/inference", show_figure(alignment.cpu().numpy(), origin='lower'), iteration)
+    print(mel_postnet.shape, alignment.shape)
+    writer.add_image("mel_pred/inference", 
+                      show_figure(mel_postnet[random_idx].float().cpu().numpy()), 
+                      iteration,
+                      dataformats='HWC')
+    writer.add_image("alignment/inference", 
+                      show_figure(alignment[random_idx].float().cpu().numpy(), origin='lower'), 
+                      iteration,
+                      dataformats='HWC')
+    print("audio gen")
     if waveglow_nvidia_repo_dir and waveglow_path:
         # generate audio of 1 random predicted mel
-        random_idx = np.random.choice(mel_postnet.size(0), 1)
-        audio = waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel_postnet[[random_idx]])
-        writer.add_audio("audio/inference", [audio], iteration)
+        audio = waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel_postnet[[random_idx]], fp16=fp16)
+        print("gen success, audio shape", audio.shape, "audio min/max", audio.min(), audio.max())
+        writer.add_audio("audio/inference", audio, iteration)
         writer.add_text("text/inference", sample_texts[random_idx])
+    end = time.time()
+    print(f"inference took {end-start:.2f} s.")
 
 
-def waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel, sigma=0.666, denoiser_strength=0.1):
+def waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel, sigma=0.666, denoiser_strength=0.1, fp16=False):
     """Generate audio with waveglow from checkpoint"""
     torch.cuda.empty_cache()
-    import sys
-    sys.path.append(waveglow_nvidia_repo_dir)
-    from denoiser import Denoiser
 
     waveglow = torch.load(waveglow_path)['model']
-    waveglow.cuda().eval().half()
+    waveglow.cuda().eval()
+    if fp16:
+        waveglow = waveglow.half()
+        mel = mel.half()
     for k in waveglow.convinv:
         k.float()
     denoiser = Denoiser(waveglow)
@@ -220,7 +252,7 @@ def waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel, sigma=0.666, deno
         audio = denoiser(waveglow.infer(mel, sigma), denoiser_strength)
     del waveglow, denoiser
     torch.cuda.empty_cache()
-    return audio.cpu().numpy()[0][0]
+    return audio.cpu().view(1, -1)
 
 
 def save_checkpoint(model, opt, iteration, best_metric, out_path, fp16):
@@ -258,9 +290,11 @@ def parse_args():
     p.add_argument("--args", default=None, type=Path, help="Load arguments from file")
     p.add_argument("--exp-name", default="default", help="Experiment name")
     p.add_argument("--ds-path", type=Path, help="Dataset metadata path")
+    p.add_argument("--validation-size", default=200, type=int, help="Dataset validation split size (seed is fixed)")
     p.add_argument("--checkpoints-path", type=Path)
     p.add_argument("--checkpoint", default=None)
 
+    p.add_argument("--learning-rate", type=float, default=3e-4, help="learning rate for optimizer")
     p.add_argument("--batch-size", type=int, default=48)
     p.add_argument("--num-epochs", type=int, default=1000)
     p.add_argument("--log-every", help="log every (iterations)", type=int, default=100)
@@ -304,6 +338,8 @@ def main():
     infer_every = args.infer_every
     waveglow_nvidia_repo_dir = args.waveglow_nvidia_repo_dir
     waveglow_path = args.waveglow_path
+    
+    print("rank", rank, "parsed logs")
 
     torch.backends.cudnn.enabled = True
     exp_dir = Path("experiments").joinpath(exp_name)
@@ -322,8 +358,9 @@ def main():
         json.dump(args_for_serialize, f, indent=2)
 
     world_size = torch.cuda.device_count() * 1  # as we have only 1 node
-    model, opt, iteration, best_metric = setup_model(distributed, rank, world_size, group_name, checkpoint, fp16,
-                                                     args.sync_bn)
+    model, opt, iteration, best_metric = setup_model(distributed, rank, world_size, group_name, checkpoint, args.learning_rate,
+                                                     fp16, args.sync_bn)
+    print("rank", rank, "setup model")
 
     train_ds = TTSDataset(ds_path, ds_type="train", validation_size=args.validation_size)
     validation_ds = TTSDataset(ds_path, ds_type="validation", validation_size=args.validation_size)
@@ -334,7 +371,12 @@ def main():
 
     data_collate = TTSCollate()
     train_loader = DataLoader(train_ds, batch_size=batch_size, collate_fn=data_collate, sampler=sampler)
-    val_loader = DataLoader(validation_ds, batch_size=batch_size, collate_fn=data_collate)
+    val_loader = DataLoader(validation_ds, batch_size=batch_size // 4, collate_fn=data_collate)
+    print("rank", rank, "dataset created")
+    if rank == 0:
+        inference(model, Path("sample_phrases.txt").read_text().split("\n"),
+                          writer, iteration, waveglow_nvidia_repo_dir, waveglow_path, fp16)
+        print("inference success")
     for epoch in range(1, num_epochs + 1):
         if rank == 0:
             print("epoch", epoch)
@@ -342,11 +384,11 @@ def main():
                           iteration=iteration, log_every=log_every, fp16=fp16, distributed=distributed)
         if rank == 0:
             print("running validation")
-            avg_metric = validate(model, val_loader, writer, iteration, distributed,
-                                  waveglow_nvidia_repo_dir, waveglow_path)
+            avg_metric = validate(model, val_loader, writer, iteration,
+                                  waveglow_nvidia_repo_dir, waveglow_path, fp16)
             if epoch % infer_every:
                 inference(model, Path("sample_phrases.txt").read_text().split("\n"),
-                          writer, iteration, waveglow_nvidia_repo_dir, waveglow_path)
+                          writer, iteration, waveglow_nvidia_repo_dir, waveglow_path, fp16)
             if avg_metric < best_metric:
                 # TODO: save last n checkpoints in terms of target metric
                 best_metric = avg_metric

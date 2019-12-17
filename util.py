@@ -18,7 +18,7 @@ def reduce_tensor(
 def success_rate(alignments: torch.Tensor):
     """Success rate metric of attention batch.
     Check if all attentions are monotonic and non flat"""
-    als_values_batch = alignments.detach().cpu().max(1)[1]
+    als_values_batch = alignments.float().detach().cpu().max(1)[1]
     success_count = 0
 
     for als_values in als_values_batch:
@@ -37,7 +37,13 @@ def show_figure(
     """Renders matplotlib figure for use in tensorboard.
     Keep in mind that for attention you should use origin=lower keyword arg
     from lower left angle to upper right"""
-    fig = plt.figure()
-    fig.imshow(image, aspect='auto', **kwargs)
-    return fig
+    fig, ax = plt.subplots()
+    im = ax.imshow(image, aspect='auto', interpolation='none', **kwargs)
+    fig.colorbar(im, ax=ax)
+    fig.canvas.draw()
+    # save it to a numpy array.
+    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    plt.close()
+    return data
 
