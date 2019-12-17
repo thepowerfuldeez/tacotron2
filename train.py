@@ -111,7 +111,6 @@ def train(model, train_loader, opt, writer, rank=0, iteration=0, log_every=100, 
             writer.add_scalar('loss/stop', stop_loss.item(), iteration)
             writer.add_scalar('success_rate/train', success_rate(alignment), iteration)
 
-            print("finding right index", i, "of", random_idx)
             if i == random_idx:
                 writer.add_image("mel_pred/train", 
                                   show_figure(mel_pred_postnet[0].float().detach().cpu().numpy()), 
@@ -163,12 +162,10 @@ def validate(
     # choose random mel-spectogram and synthesize audio from it
     random_idx = np.random.choice(len(val_loader), 1)
     for i, (text, input_lengths, mel, stop_target) in enumerate(val_loader):
-        print("batch", i)
         text = text.to("cuda", non_blocking=True)
         input_lengths = input_lengths.to("cuda", non_blocking=True)
         mel = mel.to("cuda", non_blocking=True)
         stop_target = stop_target.to("cuda", non_blocking=True)
-        print("done data prep")
         with torch.no_grad():
             mel_pred, mel_pred_postnet, stop_predictions, alignment = model(text, input_lengths, mel)
             mel_loss = F.mse_loss(mel_pred, mel)
@@ -176,11 +173,9 @@ def validate(
             stop_loss = F.binary_cross_entropy(stop_predictions, stop_target)
 
             loss = mel_loss + mel_postnet_loss + stop_loss
-            print("done loss computing")
             loss_value = loss.item()
             metric_values.append(loss_value)
             success_rates.append(success_rate(alignment))
-            print("finding right index", i, "of", random_idx)
             if i == random_idx:
                 mel_to_gen = mel_pred_postnet[0]
                 gen_alignment = alignment[0]
@@ -199,7 +194,7 @@ def validate(
     if waveglow_nvidia_repo_dir and waveglow_path:
         print('start to audio synthesis')
         writer.add_audio("audio/validation",
-                         waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel_to_gen[None], fp16=fp16), iteration)
+                         waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel_to_gen[None], fp16=fp16), iteration, sample_rate=22050)
     end = time.time()
     print(f"validation {iteration}, loss={loss_value:.3f}, {end - start:.2f} s.")
     return avg_loss
@@ -216,7 +211,6 @@ def inference(model, sample_texts, writer, iteration, waveglow_nvidia_repo_dir=N
         
     random_idx = np.random.randint(mel_postnet.size(0))
     writer.add_scalar("success_rate/inference", success_rate(alignment), iteration)
-    print(mel_postnet.shape, alignment.shape)
     writer.add_image("mel_pred/inference", 
                       show_figure(mel_postnet[random_idx].float().cpu().numpy()), 
                       iteration,
@@ -225,12 +219,11 @@ def inference(model, sample_texts, writer, iteration, waveglow_nvidia_repo_dir=N
                       show_figure(alignment[random_idx].float().cpu().numpy(), origin='lower'), 
                       iteration,
                       dataformats='HWC')
-    print("audio gen")
     if waveglow_nvidia_repo_dir and waveglow_path:
         # generate audio of 1 random predicted mel
         audio = waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel_postnet[[random_idx]], fp16=fp16)
         print("gen success, audio shape", audio.shape, "audio min/max", audio.min(), audio.max())
-        writer.add_audio("audio/inference", audio, iteration)
+        writer.add_audio("audio/inference", audio, iteration, sample_rate=22050)
         writer.add_text("text/inference", sample_texts[random_idx])
     end = time.time()
     print(f"inference took {end-start:.2f} s.")
@@ -373,17 +366,12 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=batch_size, collate_fn=data_collate, sampler=sampler)
     val_loader = DataLoader(validation_ds, batch_size=batch_size // 4, collate_fn=data_collate)
     print("rank", rank, "dataset created")
-    if rank == 0:
-        inference(model, Path("sample_phrases.txt").read_text().split("\n"),
-                          writer, iteration, waveglow_nvidia_repo_dir, waveglow_path, fp16)
-        print("inference success")
     for epoch in range(1, num_epochs + 1):
         if rank == 0:
             print("epoch", epoch)
         iteration = train(model, train_loader, opt, writer, rank,
                           iteration=iteration, log_every=log_every, fp16=fp16, distributed=distributed)
         if rank == 0:
-            print("running validation")
             avg_metric = validate(model, val_loader, writer, iteration,
                                   waveglow_nvidia_repo_dir, waveglow_path, fp16)
             if epoch % infer_every:
