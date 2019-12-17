@@ -1,10 +1,10 @@
 import argparse
+import json
 import matplotlib.pyplot as plt
 import numpy as np
 import time
 import torch
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from pathlib import Path
 from collections import OrderedDict
@@ -13,6 +13,8 @@ try:
 except ImportError: pass
 import nltk
 nltk.download('punkt')
+
+from torch.utils.tensorboard import SummaryWriter
 
 from model import Model
 from data import TTSDataset, TTSCollate
@@ -61,7 +63,22 @@ def setup_model(distributed, rank, world_size, group_name, checkpoint, fp16, syn
     return model, opt, iteration, best_metric
 
 
-def train(model, loader, opt, rank=0, iteration=0, log_every=100, fp16=False, distributed=False):
+def success_rate(alignments):
+    """Success rate of attention batch.
+    Check if all attentions are monotonic and non flat"""
+    als_values_batch = alignments.detach().cpu().max(1)[1]
+    success_count = 0
+
+    for als_values in als_values_batch:
+        differences = als_values[1:] - als_values[:-1]
+        attn_is_monotonic = int(len(als_values) * 0.8) < (differences < 3).sum()
+        attn_not_flat = differences[differences.abs() < 3].sum() > int(len(als_values) * 0.1)
+        if bool(attn_is_monotonic & attn_not_flat):
+            success_count += 1
+    return success_count / alignments.size(0)
+
+
+def train(model, loader, opt, writer, rank=0, iteration=0, log_every=100, fp16=False, distributed=False):
     """Train loop for one epoch"""
     # Explicitly setting seed to make sure that models created in two processes
     # start from same random weights and biases.
@@ -85,10 +102,16 @@ def train(model, loader, opt, rank=0, iteration=0, log_every=100, fp16=False, di
         loss = mel_loss + mel_postnet_loss + stop_loss
         
         if distributed:
+            n_gpus = torch.cude.device_count()
             loss_value = reduce_tensor(loss.data, n_gpus).item()
         else:
             loss_value = loss.item()
         metric_values.append(loss_value)
+        writer.add_scalar('loss/train', loss_value, iteration)
+        writer.add_scalar('loss/mel', mel_loss.item(), iteration)
+        writer.add_scalar('loss/mel_postnet', mel_postnet_loss.item(), iteration)
+        writer.add_scalar('loss/stop', stop_loss.item(), iteration)
+        writer.add_scalar('success_rate/train', success_rate(alignment), iteration)
         
         if fp16:
             with amp.scale_loss(loss, opt) as scaled_loss:
@@ -155,6 +178,7 @@ def load_checkpoint(checkpoint_path, model, opt, fp16, rank):
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--args", default=None, type=Path, help="Load arguments from file")
     p.add_argument("--ds-path", type=Path, help="Dataset metadata path")
     p.add_argument("--checkpoints-path", type=Path)
     p.add_argument("--checkpoint", default=None)
@@ -173,8 +197,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # load arguments from file
+    if args.args is not None:
+        args.__dict__ = json.load(args.args.open())
 
-    checkpoints_path = args.checkpoints_path
+    exp_name = args.exp_name
     checkpoint = args.checkpoint
     ds_path = args.ds_path
     batch_size = args.batch_size
@@ -187,6 +214,11 @@ def main():
     group_name = args.group_name
     
     torch.backends.cudnn.enabled = True
+    exp_dir = Path("experiments").joinpath(exp_name)
+    exp_dir.mkdir(exist_ok=True)
+    writer = SummaryWriter(exp_dir)
+    with exp_dir.joinpath('commandline_args.txt').open('w') as f:
+        json.dump(args.__dict__, f, indent=2)
 
     world_size = torch.cuda.device_count() * 1  # as we have only 1 node
     model, opt, iteration, best_metric = setup_model(distributed, rank, world_size, group_name, checkpoint, fp16, args.sync_bn)
@@ -200,7 +232,8 @@ def main():
     for epoch in range(1, num_epochs + 1):
         if rank == 0:
             print("epoch", epoch)
-        iteration, avg_metric = train(model, loader, opt, rank, iteration=iteration, log_every=log_every, fp16=fp16)
+        iteration, avg_metric = train(model, loader, opt, writer, rank,
+                                      iteration=iteration, log_every=log_every, fp16=fp16, distributed=distributed)
         # for jupyter notebook
         # if iteration % 25 == 0:
         # clear_output(True)
@@ -208,9 +241,9 @@ def main():
         if rank == 0:
             if avg_metric < best_metric:
                 best_metric = avg_metric
-                save_checkpoint(model, opt, iteration, best_metric, checkpoints_path.joinpath("model_best.pth"), fp16)
+                save_checkpoint(model, opt, iteration, best_metric, exp_dir.joinpath("model_best.pth"), fp16)
             if epoch % save_every == 0:
-                save_checkpoint(model, opt, iteration, best_metric, checkpoints_path.joinpath("model_last.pth"), fp16)
+                save_checkpoint(model, opt, iteration, best_metric, exp_dir.joinpath("model_last.pth"), fp16)
     cleanup_distributed()
 
 
