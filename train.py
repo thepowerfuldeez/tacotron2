@@ -1,6 +1,5 @@
 import argparse
 import json
-import matplotlib.pyplot as plt
 import numpy as np
 import time
 import torch
@@ -8,10 +7,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 from collections import OrderedDict
+
 try:
     from apex import amp
-except ImportError: pass
+except ImportError:
+    pass
 import nltk
+
 nltk.download('punkt')
 
 from torch.utils.tensorboard import SummaryWriter
@@ -19,36 +21,39 @@ from torch.utils.tensorboard import SummaryWriter
 from model import Model
 from data import TTSDataset, TTSCollate
 from distributed import setup_distributed, apply_gradient_allreduce, cleanup_distributed
+from text import encode_text
+from util import reduce_tensor, show_figure, success_rate
 
 
-def reduce_tensor(tensor, n_gpus):
-    rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.reduce_op.SUM)
-    rt /= n_gpus
-    return rt
-    
-
-def setup_model(distributed, rank, world_size, group_name, checkpoint, fp16, sync_bn):
+def setup_model(
+        distributed: bool,
+        rank: int,
+        world_size: int,
+        group_name: str,
+        checkpoint: str,
+        fp16: bool,
+        sync_bn: bool
+):
     """Create model, cast to fp16 if needed, load checkpoint, apply DDP and sync_bn if needed"""
     torch.cuda.set_device(rank)
     model = Model(fp16=fp16)
     model = model.to(rank)  # move model to appropriate gpu when using distributed training
     opt = torch.optim.Adam(model.parameters())
-    
+
     # order is important: cast to fp16 first, load fp16 checkpoint (with amp weights), apply DDP, apply sync_bn
     # as stated here: https://github.com/NVIDIA/apex/tree/master/examples/imagenet
     if fp16:
         # Initialization with apex
         opt_level = 'O2'
         model, opt = amp.initialize(model, opt, opt_level=opt_level)
-    
+
     iteration = 0
     best_metric = 1e3
     if checkpoint:
         iteration, best_metric = load_checkpoint(checkpoint, model, opt, fp16, rank)
         print(f"resuming from {iteration} iteration")
 
-    if distributed:        
+    if distributed:
         # set default .to('cuda') behavior to current local rank
         setup_distributed(rank, world_size, group_name)
         model = apply_gradient_allreduce(model)
@@ -56,94 +61,166 @@ def setup_model(distributed, rank, world_size, group_name, checkpoint, fp16, syn
 
     if sync_bn:
         from apex.parallel import convert_syncbn_model
-        
+
         if rank == 0:
             print("using apex synced BN")
         model = convert_syncbn_model(model)
     return model, opt, iteration, best_metric
 
 
-def success_rate(alignments):
-    """Success rate of attention batch.
-    Check if all attentions are monotonic and non flat"""
-    als_values_batch = alignments.detach().cpu().max(1)[1]
-    success_count = 0
-
-    for als_values in als_values_batch:
-        differences = als_values[1:] - als_values[:-1]
-        attn_is_monotonic = int(len(als_values) * 0.8) < (differences < 3).sum()
-        attn_not_flat = differences[differences.abs() < 3].sum() > int(len(als_values) * 0.1)
-        if bool(attn_is_monotonic & attn_not_flat):
-            success_count += 1
-    return success_count / alignments.size(0)
-
-
-def train(model, loader, opt, writer, rank=0, iteration=0, log_every=100, fp16=False, distributed=False):
+def train(model, train_loader, opt, writer, rank=0, iteration=0, log_every=100, fp16=False, distributed=False):
     """Train loop for one epoch"""
     # Explicitly setting seed to make sure that models created in two processes
     # start from same random weights and biases.
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
-    metric_values = []
-    for text, input_lengths, mel, stop_target in loader:
+
+    # randomly choose index of loader to send images and attention to tensorboard (send only one per epoch)
+    random_idx = np.random.choice(len(train_loader), 1)
+    model.train()
+    for i, (text, input_lengths, mel, stop_target) in enumerate(train_loader):
         text = text.to("cuda", non_blocking=True)
         input_lengths = input_lengths.to("cuda", non_blocking=True)
         mel = mel.to("cuda", non_blocking=True)
         stop_target = stop_target.to("cuda", non_blocking=True)
         iteration += 1
-        
+
         start = time.time()
         opt.zero_grad()
         mel_pred, mel_pred_postnet, stop_predictions, alignment = model(text, input_lengths, mel)
         mel_loss = F.mse_loss(mel_pred, mel)
         mel_postnet_loss = F.mse_loss(mel_pred_postnet, mel)
         stop_loss = F.binary_cross_entropy(stop_predictions, stop_target)
-        
+
         loss = mel_loss + mel_postnet_loss + stop_loss
-        
+
         if distributed:
-            n_gpus = torch.cude.device_count()
+            n_gpus = torch.cuda.device_count()
             loss_value = reduce_tensor(loss.data, n_gpus).item()
         else:
             loss_value = loss.item()
-        metric_values.append(loss_value)
-        writer.add_scalar('loss/train', loss_value, iteration)
-        writer.add_scalar('loss/mel', mel_loss.item(), iteration)
-        writer.add_scalar('loss/mel_postnet', mel_postnet_loss.item(), iteration)
-        writer.add_scalar('loss/stop', stop_loss.item(), iteration)
-        writer.add_scalar('success_rate/train', success_rate(alignment), iteration)
-        
+        if rank == 0:
+            writer.add_scalar('loss/train', loss_value, iteration)
+            writer.add_scalar('loss/mel', mel_loss.item(), iteration)
+            writer.add_scalar('loss/mel_postnet', mel_postnet_loss.item(), iteration)
+            writer.add_scalar('loss/stop', stop_loss.item(), iteration)
+            writer.add_scalar('success_rate/train', success_rate(alignment), iteration)
+
+            print("finding right index", i, "of", random_idx)
+            if i == random_idx:
+                writer.add_figure("mel_pred/train", show_figure(mel_pred_postnet.cpu().numpy()[0]), iteration)
+                writer.add_figure("alignment/train", show_figure(alignment.cpu().numpy(), origin='lower'), iteration)
+
         if fp16:
             with amp.scale_loss(loss, opt) as scaled_loss:
                 scaled_loss.backward()
         else:
-            loss.backward()            
-        
+            loss.backward()
+
         if fp16:
             grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(opt), 1.0)
-            is_overflow = np.isnan(grad_norm)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
+
         opt.step()
         end = time.time()
-        
+
         # print only if it's first device (rank == 0)
         if iteration % log_every == 0 and rank == 0:
-            print(f"{iteration}, grad_norm={grad_norm:.3f}, mel_loss.item()={mel_loss.item():.3f}, mel_postnet_loss.item()={mel_postnet_loss.item():.3f}, stop_loss.item()={stop_loss.item():.3f}, {end-start:.2f} s.")
-    return iteration, np.mean(metric_values)
+            print(f"train {iteration}, grad_norm={grad_norm:.3f}, mel_loss.item()={mel_loss.item():.3f}, "
+                  f"mel_postnet_loss.item()={mel_postnet_loss.item():.3f}, stop_loss.item()={stop_loss.item():.3f}, "
+                  f"{end - start:.2f} s.")
+    return iteration
 
 
-def test_alignment(batch, model):
-    """For use in jupyter notebook or for tensorboard logging"""
-    text, input_lengths, mel, stop_target = TTSCollate()(batch)
-    with torch.no_grad():
+def validate(
+        model: Model,
+        val_loader: DataLoader,
+        writer: SummaryWriter,
+        iteration: int,
+        distributed: bool = False,
+        waveglow_nvidia_repo_dir: Path = None,
+        waveglow_path: Path = None
+):
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    metric_values, success_rates = [], []
+    model.eval()
+    start = time.time()
+
+    # choose random mel-spectogram and synthesize audio from it
+    random_idx = np.random.choice(len(val_loader), 1)
+    for i, (text, input_lengths, mel, stop_target) in enumerate(val_loader):
         text = text.to("cuda", non_blocking=True)
         input_lengths = input_lengths.to("cuda", non_blocking=True)
         mel = mel.to("cuda", non_blocking=True)
-        mel_pred, mel_pred_postnet, stop_predictions, alignment = model(text, input_lengths, mel)
-    plt.imshow(alignment.cpu().numpy()[0][::-1], aspect='auto')
-    plt.show()
+        stop_target = stop_target.to("cuda", non_blocking=True)
+        with torch.no_grad():
+            mel_pred, mel_pred_postnet, stop_predictions, alignment = model(text, input_lengths, mel)
+            mel_loss = F.mse_loss(mel_pred, mel)
+            mel_postnet_loss = F.mse_loss(mel_pred_postnet, mel)
+            stop_loss = F.binary_cross_entropy(stop_predictions, stop_target)
+
+            loss = mel_loss + mel_postnet_loss + stop_loss
+            if distributed:
+                n_gpus = torch.cuda.device_count()
+                loss_value = reduce_tensor(loss.data, n_gpus).item()
+            else:
+                loss_value = loss.item()
+            metric_values.append(loss_value)
+            success_rates.append(success_rate(alignment))
+            print("finding right index", i, "of", random_idx)
+            if i == random_idx:
+                mel_to_gen = mel_pred_postnet
+    avg_loss = np.mean(metric_values)
+    avg_success_rate = np.mean(success_rates)
+    writer.add_scalar('loss/validation', avg_loss, iteration)
+    writer.add_scalar('success_rate/validation', avg_success_rate, iteration)
+    writer.add_figure("mel_pred/validation", show_figure(mel_pred_postnet.cpu().numpy()), iteration)
+    writer.add_figure("alignment/validation", show_figure(alignment.cpu().numpy(), origin='lower'), iteration)
+    if waveglow_nvidia_repo_dir and waveglow_path:
+        writer.add_audio("audio/validation",
+                         waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel_to_gen), iteration)
+    end = time.time()
+    print(f"validation {iteration}, loss={loss_value:.3f}, {end - start:.2f} s.")
+    return avg_loss
+
+
+def inference(model, sample_texts, writer, iteration, waveglow_nvidia_repo_dir=None, waveglow_path=None):
+    """Perform inference on test set of only texts (no target mel provided)"""
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    text_encoded = [encode_text(text) for text in sample_texts]
+    with torch.no_grad():
+        mel_postnet, alignment = model.inference(text_encoded)
+    writer.add_scalar("success_rate/inference", success_rate(alignment), iteration)
+    writer.add_figure("mel_pred/inference", show_figure(mel_postnet.cpu().numpy()), iteration)
+    writer.add_figure("alignment/inference", show_figure(alignment.cpu().numpy(), origin='lower'), iteration)
+    if waveglow_nvidia_repo_dir and waveglow_path:
+        # generate audio of 1 random predicted mel
+        random_idx = np.random.choice(mel_postnet.size(0), 1)
+        audio = waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel_postnet[[random_idx]])
+        writer.add_audio("audio/inference", [audio], iteration)
+        writer.add_text("text/inference", sample_texts[random_idx])
+
+
+def waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel, sigma=0.666, denoiser_strength=0.1):
+    """Generate audio with waveglow from checkpoint"""
+    torch.cuda.empty_cache()
+    import sys
+    sys.path.append(waveglow_nvidia_repo_dir)
+    from denoiser import Denoiser
+
+    waveglow = torch.load(waveglow_path)['model']
+    waveglow.cuda().eval().half()
+    for k in waveglow.convinv:
+        k.float()
+    denoiser = Denoiser(waveglow)
+    with torch.no_grad():
+        audio = denoiser(waveglow.infer(mel, sigma), denoiser_strength)
+    del waveglow, denoiser
+    torch.cuda.empty_cache()
+    return audio.cpu().numpy()[0][0]
 
 
 def save_checkpoint(model, opt, iteration, best_metric, out_path, fp16):
@@ -163,7 +240,7 @@ def load_checkpoint(checkpoint_path, model, opt, fp16, rank):
     # we should load checkpoint on appropriate gpu device, derived from local_rank, use lambda (example from
     # https://github.com/NVIDIA/apex/blob/master/examples/imagenet/main_amp.py )
     checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage.cuda(rank))
-    state_dict = checkpoint['state_dict'] 
+    state_dict = checkpoint['state_dict']
     if "module." in list(state_dict.keys())[0]:
         new_state_dict = OrderedDict()
         for k, v in state_dict.items():
@@ -194,13 +271,24 @@ def parse_args():
     p.add_argument("--group-name", help="Distributed group name")
     p.add_argument("--rank", help="for DDP, default device", default=0, type=int)
     p.add_argument("--sync-bn", help="synchronized batchnorm for distributed", action="store_true")
+
+    p.add_argument("--infer-every", help="inference on test phrases every (epochs)", default=5, type=int)
+    p.add_argument("--waveglow_nvidia_repo_dir", help="repo for waveglow if infer", default=None, type=Path)
+    p.add_argument("--waveglow_path", help="path to waveglow checkpoint", default=None, type=Path)
     return p.parse_args()
+
 
 def main():
     args = parse_args()
     # load arguments from file
     if args.args is not None:
-        args.__dict__ = json.load(args.args.open())
+        args_dict = json.load(args.args.open())
+        serialized_keys = args_dict['serialized_keys']
+        for k, v in args_dict.items():
+            if k in serialized_keys:
+                args.__dict__[k] = Path(v)
+            else:
+                args.__dict__[k] = v
 
     exp_name = args.exp_name
     checkpoint = args.checkpoint
@@ -213,40 +301,54 @@ def main():
     rank = args.rank
     distributed = args.distributed
     group_name = args.group_name
-    
+    infer_every = args.infer_every
+    waveglow_nvidia_repo_dir = args.waveglow_nvidia_repo_dir
+    waveglow_path = args.waveglow_path
+
     torch.backends.cudnn.enabled = True
     exp_dir = Path("experiments").joinpath(exp_name)
     exp_dir.mkdir(exist_ok=True)
     writer = SummaryWriter(str(exp_dir), flush_secs=30)
     with exp_dir.joinpath('commandline_args.txt').open('w') as f:
         args_for_serialize = {}
-        for k, v in args.__dict__:
+        serialized_keys = []
+        for k, v in args.__dict__.items():
             if isinstance(v, Path):
                 args_for_serialize[k] = str(v)
+                serialized_keys.append(k)
             else:
                 args_for_serialize[k] = v
+        args_for_serialize['serialized_keys'] = serialized_keys
         json.dump(args_for_serialize, f, indent=2)
 
     world_size = torch.cuda.device_count() * 1  # as we have only 1 node
-    model, opt, iteration, best_metric = setup_model(distributed, rank, world_size, group_name, checkpoint, fp16, args.sync_bn)
-    
-    ds = TTSDataset(ds_path)
+    model, opt, iteration, best_metric = setup_model(distributed, rank, world_size, group_name, checkpoint, fp16,
+                                                     args.sync_bn)
+
+    train_ds = TTSDataset(ds_path, ds_type="train", validation_size=args.validation_size)
+    validation_ds = TTSDataset(ds_path, ds_type="validation", validation_size=args.validation_size)
+
     sampler = None
     if distributed:
-        sampler = torch.utils.data.distributed.DistributedSampler(ds, num_replicas=world_size, rank=rank)
+        sampler = torch.utils.data.distributed.DistributedSampler(train_ds, num_replicas=world_size, rank=rank)
 
-    loader = DataLoader(ds, batch_size=batch_size, collate_fn=TTSCollate(), sampler=sampler)
+    data_collate = TTSCollate()
+    train_loader = DataLoader(train_ds, batch_size=batch_size, collate_fn=data_collate, sampler=sampler)
+    val_loader = DataLoader(validation_ds, batch_size=batch_size, collate_fn=data_collate)
     for epoch in range(1, num_epochs + 1):
         if rank == 0:
             print("epoch", epoch)
-        iteration, avg_metric = train(model, loader, opt, writer, rank,
-                                      iteration=iteration, log_every=log_every, fp16=fp16, distributed=distributed)
-        # for jupyter notebook
-        # if iteration % 25 == 0:
-        # clear_output(True)
-        # test_alignment([ds[0]], model)
+        iteration = train(model, train_loader, opt, writer, rank,
+                          iteration=iteration, log_every=log_every, fp16=fp16, distributed=distributed)
         if rank == 0:
+            print("running validation")
+            avg_metric = validate(model, val_loader, writer, iteration, distributed,
+                                  waveglow_nvidia_repo_dir, waveglow_path)
+            if epoch % infer_every:
+                inference(model, Path("sample_phrases.txt").read_text().split("\n"),
+                          writer, iteration, waveglow_nvidia_repo_dir, waveglow_path)
             if avg_metric < best_metric:
+                # TODO: save last n checkpoints in terms of target metric
                 best_metric = avg_metric
                 save_checkpoint(model, opt, iteration, best_metric, exp_dir.joinpath("model_best.pth"), fp16)
             if epoch % save_every == 0:

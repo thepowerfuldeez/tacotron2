@@ -8,11 +8,26 @@ from text import encode_text
 
 
 class TTSDataset(Dataset):
-    def __init__(self, data_path: Path):
+    def __init__(
+            self,
+            data_path: Path,
+            ds_type: str = "train",
+            validation_size: int = 200,
+            seed: int = 42
+    ):
+        np.random.seed(seed)
         self.path = data_path.parent
         self.metadata = [line.split("|") for line in data_path.read_text().split("\n")[:-1]]
+        assert len(self.metadata) > validation_size
         self.metadata = np.array([line for line in self.metadata
                                   if self.path.joinpath("mels").joinpath(line[0]).with_suffix(".npy").exists()])
+
+        # apply proper indices
+        validation_indices = np.random.choice(len(self.metadata), validation_size)
+        if ds_type == "train":
+            self.metadata = self.metadata[~np.in1d(np.arange(len(self.metadata)), validation_indices)]
+        elif ds_type == "validation":
+            self.metadata = self.metadata[np.in1d(np.arange(len(self.metadata)), validation_indices)]
 
         self.processed_texts = []
         for line in tqdm(self.metadata):

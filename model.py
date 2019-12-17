@@ -148,18 +148,14 @@ class Decoder(nn.Module):
 
     def init_hidden(self, batch_size, device="cpu", fp16=False):
         """Initialize hidden rnn state with tuple of zeros"""
-#         return tuple(torch.zeros(self.decoder_n_layers, batch_size, self.hidden_size, device=device)
-#                      for _ in range(self.decoder_n_layers))
         hidden = tuple(torch.zeros(self.decoder_n_layers, batch_size, self.hidden_size, device=device)
                        for _ in range(self.decoder_n_layers))
         if fp16:
             hidden = tuple([h.half() for h in hidden])
         return hidden
-                     
 
     def init_mel_input(self, batch_size, device="cpu", fp16=False):
         """Initialize mel_input with zeros"""
-#         return torch.zeros(batch_size, 1, self.mel_channels, device=device)
         mel_input = torch.zeros(batch_size, 1, self.mel_channels, device=device)
         if fp16:
             mel_input = mel_input.half()
@@ -237,6 +233,6 @@ class Model(nn.Module):
 
     def inference(self, x):
         with torch.no_grad():
-            encoder_outputs = self.encoder(x, torch.tensor([len(x[0])], device=x.device))
+            encoder_outputs = self.encoder(x, torch.tensor([len(it) for it in x], device=x.device))
             mel_postnet, alignment = self.decoder.inference(encoder_outputs)
         return mel_postnet, alignment
