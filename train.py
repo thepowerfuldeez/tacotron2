@@ -219,7 +219,13 @@ def main():
     exp_dir.mkdir(exist_ok=True)
     writer = SummaryWriter(str(exp_dir), flush_secs=30)
     with exp_dir.joinpath('commandline_args.txt').open('w') as f:
-        json.dump(args.__dict__, f, indent=2)
+        args_for_serialize = {}
+        for k, v in args.__dict__:
+            if isinstance(v, Path):
+                args_for_serialize[k] = str(v)
+            else:
+                args_for_serialize[k] = v
+        json.dump(args_for_serialize, f, indent=2)
 
     world_size = torch.cuda.device_count() * 1  # as we have only 1 node
     model, opt, iteration, best_metric = setup_model(distributed, rank, world_size, group_name, checkpoint, fp16, args.sync_bn)
