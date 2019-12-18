@@ -53,18 +53,28 @@ class Attention(nn.Module):
     Input: (last_prenet_output, current_hidden_state, encoder_outputs)
     Output: context vector (weighted sum of encoder_outputs, b x 1 x encoder_rnn_size), attention_weights (b x seq_len)"""
 
-    def __init__(self, prenet_size=256, hidden_size=1024, max_length=MAX_LENGTH):
+    def __init__(self, prenet_size=256, hidden_size=1024, attention_size=128, max_length=MAX_LENGTH):
         super().__init__()
 
-        self.attention_linear = nn.Linear(prenet_size + hidden_size, max_length)
+        self.prenet_projection = nn.Linear(prenet_size, attention_size, bias=False)  # a.k.a. query
+        self.hidden_projection = nn.Linear(hidden_size, attention_size, bias=False)  # a.k.a. keys
+
+        # as we use non-relu activation after linear layer better to initialize weights differently
+        torch.nn.init.xavier_uniform_(self.prenet_projection, torch.nn.init.calculate_gain("tanh"))
+        torch.nn.init.xavier_uniform_(self.hidden_projection, torch.nn.init.calculate_gain("tanh"))
+
+        self.attention_linear = nn.Linear(attention_size, max_length)  # a.k.a. value
 
     def forward(self, decoder_input, hidden, encoder_outputs):
-        energies = self.attention_linear(torch.cat((decoder_input, hidden), -1))
-        energies = F.dropout(energies, p_dropout, self.training)
         mask = encoder_outputs.sum(-1) == 0
-        attention_weights = F.softmax(
-            energies[:, :encoder_outputs.size(1)].masked_fill(mask, float('-inf')), -1
-        ).unsqueeze(1)
+        decoder_input = self.prenet_projection(decoder_input)
+        hidden = self.hidden_projection(hidden)
+
+        energies = self.attention_linear(torch.tanh(decoder_input + hidden))
+        # fill masked values with -inf to get exact zero after softmax
+        energies = energies[:, :encoder_outputs.size(1)].masked_fill(mask, float('-inf'))
+
+        attention_weights = F.softmax(energies, -1).unsqueeze(1)
         attention_context = torch.bmm(attention_weights, encoder_outputs)
         return attention_context, attention_weights
 
