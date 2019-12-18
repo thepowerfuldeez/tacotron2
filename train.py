@@ -131,6 +131,8 @@ def train(model, train_loader, opt, writer, rank=0, iteration=0, log_every=100, 
             grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(opt), 1.0)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if rank == 0 and not np.isnan(grad_norm):
+            writer.add_scalar("grad_norm", grad_norm, iteration)
 
         opt.step()
         end = time.time()
@@ -372,17 +374,21 @@ def main():
         iteration = train(model, train_loader, opt, writer, rank,
                           iteration=iteration, log_every=log_every, fp16=fp16, distributed=distributed)
         if rank == 0:
-            avg_metric = validate(model, val_loader, writer, iteration,
-                                  waveglow_nvidia_repo_dir, waveglow_path, fp16)
-            if epoch % infer_every:
-                inference(model, Path("sample_phrases.txt").read_text().split("\n"),
-                          writer, iteration, waveglow_nvidia_repo_dir, waveglow_path, fp16)
-            if avg_metric < best_metric:
-                # TODO: save last n checkpoints in terms of target metric
-                best_metric = avg_metric
-                save_checkpoint(model, opt, iteration, best_metric, exp_dir.joinpath("model_best.pth"), fp16)
-            if epoch % save_every == 0:
-                save_checkpoint(model, opt, iteration, best_metric, exp_dir.joinpath("model_last.pth"), fp16)
+            try:
+                avg_metric = validate(model, val_loader, writer, iteration,
+                                      waveglow_nvidia_repo_dir, waveglow_path, fp16)
+                if epoch % infer_every:
+                    inference(model, Path("sample_phrases.txt").read_text().split("\n"),
+                              writer, iteration, waveglow_nvidia_repo_dir, waveglow_path, fp16)
+                if avg_metric < best_metric:
+                    # TODO: save last n checkpoints in terms of target metric
+                    best_metric = avg_metric
+                    save_checkpoint(model, opt, iteration, best_metric, exp_dir.joinpath("model_best.pth"), fp16)
+                if epoch % save_every == 0:
+                    save_checkpoint(model, opt, iteration, best_metric, exp_dir.joinpath("model_last.pth"), fp16)
+            except Exception as e:
+                print("exception occured", e)
+                save_checkpoint(model, opt, iteration, best_metric, exp_dir.joinpath("model_fail.pth"), fp16)
     cleanup_distributed()
 
 
