@@ -274,10 +274,12 @@ def load_checkpoint(checkpoint_path, model, opt, fp16, rank, warm_load_keys=()):
             if k not in warm_load_keys:
                 new_state_dict[k] = v
         state_dict = new_state_dict
+    else:
+        # load optimizer state and apex state only if no warm load keys specified
+        opt.load_state_dict(checkpoint['opt'])
+        if fp16 and 'amp' in checkpoint:
+            amp.load_state_dict(checkpoint['amp'])
     model.load_state_dict(state_dict)
-    opt.load_state_dict(checkpoint['opt'])
-    if fp16 and 'amp' in checkpoint:
-        amp.load_state_dict(checkpoint['amp'])
     return checkpoint['iteration'], checkpoint['best_metric']
 
 
