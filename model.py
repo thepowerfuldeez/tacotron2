@@ -60,8 +60,10 @@ class Attention(nn.Module):
         self.hidden_projection = nn.Linear(hidden_size, attention_size, bias=False)  # a.k.a. keys
 
         # as we use non-relu activation after linear layer better to initialize weights differently
-        torch.nn.init.xavier_uniform_(self.prenet_projection, torch.nn.init.calculate_gain("tanh"))
-        torch.nn.init.xavier_uniform_(self.hidden_projection, torch.nn.init.calculate_gain("tanh"))
+        self.prenet_projection.weight = torch.nn.init.kaiming_uniform_(
+            self.prenet_projection.weight, nonlinearity="tanh")
+        self.hidden_projection.weight = torch.nn.init.kaiming_uniform_(
+            self.hidden_projection.weight, nonlinearity="tanh")
 
         self.attention_linear = nn.Linear(attention_size, max_length)  # a.k.a. value
 
@@ -124,6 +126,9 @@ class Postnet(nn.Module):
             nn.BatchNorm1d(80),
             nn.Dropout(p_dropout)
         ))
+
+        for conv in self.convs[:-1]:
+            conv[0].weight = torch.nn.init.kaiming_uniform_(conv[0].weight, nonlinearity='tanh')
 
     def forward(self, x):
         for conv in self.convs:

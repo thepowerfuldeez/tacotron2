@@ -36,7 +36,8 @@ def setup_model(
         checkpoint: str,
         learning_rate: float,
         fp16: bool,
-        sync_bn: bool
+        sync_bn: bool,
+        warm_load_keys: tuple
 ):
     """Create model, cast to fp16 if needed, load checkpoint, apply DDP and sync_bn if needed"""
     torch.cuda.set_device(rank)
@@ -54,7 +55,7 @@ def setup_model(
     iteration = 0
     best_metric = 1e3
     if checkpoint:
-        iteration, best_metric = load_checkpoint(checkpoint, model, opt, fp16, rank)
+        iteration, best_metric = load_checkpoint(checkpoint, model, opt, fp16, rank, warm_load_keys)
         print(f"resuming from {iteration} iteration")
 
     if distributed:
@@ -150,7 +151,6 @@ def validate(
         val_loader: DataLoader,
         writer: SummaryWriter,
         iteration: int,
-        waveglow_nvidia_repo_dir: Path = None,
         waveglow_path: Path = None,
         fp16: bool = False
 ):
@@ -193,16 +193,16 @@ def validate(
                       show_figure(gen_alignment.float().cpu().numpy(), origin='lower'), 
                       iteration,
                       dataformats='HWC')
-    if waveglow_nvidia_repo_dir and waveglow_path:
+    if waveglow_path:
         print('start to audio synthesis')
         writer.add_audio("audio/validation",
-                         waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel_to_gen[None], fp16=fp16), iteration, sample_rate=22050)
+                         waveglow_gen(waveglow_path, mel_to_gen[None], fp16=fp16), iteration, sample_rate=22050)
     end = time.time()
     print(f"validation {iteration}, loss={loss_value:.3f}, {end - start:.2f} s.")
     return avg_loss
 
 
-def inference(model, sample_texts, writer, iteration, waveglow_nvidia_repo_dir=None, waveglow_path=None, fp16=False):
+def inference(model, sample_texts, writer, iteration, waveglow_path=None, fp16=False):
     """Perform inference on test set of only texts (no target mel provided)"""
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -221,9 +221,9 @@ def inference(model, sample_texts, writer, iteration, waveglow_nvidia_repo_dir=N
                       show_figure(alignment[random_idx].float().cpu().numpy(), origin='lower'), 
                       iteration,
                       dataformats='HWC')
-    if waveglow_nvidia_repo_dir and waveglow_path:
+    if waveglow_path:
         # generate audio of 1 random predicted mel
-        audio = waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel_postnet[[random_idx]], fp16=fp16)
+        audio = waveglow_gen(waveglow_path, mel_postnet[[random_idx]], fp16=fp16)
         print("gen success, audio shape", audio.shape, "audio min/max", audio.min(), audio.max())
         writer.add_audio("audio/inference", audio, iteration, sample_rate=22050)
         writer.add_text("text/inference", sample_texts[random_idx])
@@ -231,7 +231,7 @@ def inference(model, sample_texts, writer, iteration, waveglow_nvidia_repo_dir=N
     print(f"inference took {end-start:.2f} s.")
 
 
-def waveglow_gen(waveglow_nvidia_repo_dir, waveglow_path, mel, sigma=0.666, denoiser_strength=0.1, fp16=False):
+def waveglow_gen(waveglow_path, mel, sigma=0.666, denoiser_strength=0.1, fp16=False):
     """Generate audio with waveglow from checkpoint"""
     torch.cuda.empty_cache()
 
@@ -262,16 +262,17 @@ def save_checkpoint(model, opt, iteration, best_metric, out_path, fp16):
     torch.save(checkpoint, out_path)
 
 
-def load_checkpoint(checkpoint_path, model, opt, fp16, rank):
+def load_checkpoint(checkpoint_path, model, opt, fp16, rank, warm_load_keys=()):
     """Load amp, model and optimizer states"""
     # we should load checkpoint on appropriate gpu device, derived from local_rank, use lambda (example from
     # https://github.com/NVIDIA/apex/blob/master/examples/imagenet/main_amp.py )
     checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage.cuda(rank))
     state_dict = checkpoint['state_dict']
-    if "module." in list(state_dict.keys())[0]:
-        new_state_dict = OrderedDict()
+    if len(warm_load_keys):
+        new_state_dict = model.state_dict()
         for k, v in state_dict.items():
-            new_state_dict[k[len("module."):]] = v
+            if k not in warm_load_keys:
+                new_state_dict[k] = v
         state_dict = new_state_dict
     model.load_state_dict(state_dict)
     opt.load_state_dict(checkpoint['opt'])
@@ -282,12 +283,12 @@ def load_checkpoint(checkpoint_path, model, opt, fp16, rank):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--args", default=None, type=Path, help="Load arguments from file")
     p.add_argument("--exp-name", default="default", help="Experiment name")
     p.add_argument("--ds-path", type=Path, help="Dataset metadata path")
     p.add_argument("--validation-size", default=200, type=int, help="Dataset validation split size (seed is fixed)")
     p.add_argument("--checkpoints-path", type=Path)
     p.add_argument("--checkpoint", default=None)
+    p.add_argument("--warm-load-keys", default=(), nargs="*", type=str)
 
     p.add_argument("--learning-rate", type=float, default=3e-4, help="learning rate for optimizer")
     p.add_argument("--batch-size", type=int, default=48)
@@ -302,22 +303,12 @@ def parse_args():
     p.add_argument("--sync-bn", help="synchronized batchnorm for distributed", action="store_true")
 
     p.add_argument("--infer-every", help="inference on test phrases every (epochs)", default=5, type=int)
-    p.add_argument("--waveglow_nvidia_repo_dir", help="repo for waveglow if infer", default=None, type=Path)
-    p.add_argument("--waveglow_path", help="path to waveglow checkpoint", default=None, type=Path)
+    p.add_argument("--waveglow-path", help="path to waveglow checkpoint", default=None, type=Path)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    # load arguments from file
-    if args.args is not None:
-        args_dict = json.load(args.args.open())
-        serialized_keys = args_dict['serialized_keys']
-        for k, v in args_dict.items():
-            if k in serialized_keys:
-                args.__dict__[k] = Path(v)
-            else:
-                args.__dict__[k] = v
 
     exp_name = args.exp_name
     checkpoint = args.checkpoint
@@ -331,31 +322,16 @@ def main():
     distributed = args.distributed
     group_name = args.group_name
     infer_every = args.infer_every
-    waveglow_nvidia_repo_dir = args.waveglow_nvidia_repo_dir
     waveglow_path = args.waveglow_path
     
-    print("rank", rank, "parsed logs")
-
     torch.backends.cudnn.enabled = True
     exp_dir = Path("experiments").joinpath(exp_name)
     exp_dir.mkdir(exist_ok=True)
     writer = SummaryWriter(str(exp_dir), flush_secs=30)
-    with exp_dir.joinpath('commandline_args.txt').open('w') as f:
-        args_for_serialize = {}
-        serialized_keys = []
-        for k, v in args.__dict__.items():
-            if isinstance(v, Path):
-                args_for_serialize[k] = str(v)
-                serialized_keys.append(k)
-            else:
-                args_for_serialize[k] = v
-        args_for_serialize['serialized_keys'] = serialized_keys
-        json.dump(args_for_serialize, f, indent=2)
 
     world_size = torch.cuda.device_count() * 1  # as we have only 1 node
-    model, opt, iteration, best_metric = setup_model(distributed, rank, world_size, group_name, checkpoint, args.learning_rate,
-                                                     fp16, args.sync_bn)
-    print("rank", rank, "setup model")
+    model, opt, iteration, best_metric = setup_model(distributed, rank, world_size, group_name, checkpoint,
+                                                     args.learning_rate, fp16, args.sync_bn, tuple(args.warm_load_keys))
 
     train_ds = TTSDataset(ds_path, ds_type="train", validation_size=args.validation_size)
     validation_ds = TTSDataset(ds_path, ds_type="validation", validation_size=args.validation_size)
@@ -367,7 +343,6 @@ def main():
     data_collate = TTSCollate()
     train_loader = DataLoader(train_ds, batch_size=batch_size, collate_fn=data_collate, sampler=sampler)
     val_loader = DataLoader(validation_ds, batch_size=batch_size // 4, collate_fn=data_collate)
-    print("rank", rank, "dataset created")
     for epoch in range(1, num_epochs + 1):
         if rank == 0:
             print("epoch", epoch)
@@ -375,11 +350,10 @@ def main():
                           iteration=iteration, log_every=log_every, fp16=fp16, distributed=distributed)
         if rank == 0:
             try:
-                avg_metric = validate(model, val_loader, writer, iteration,
-                                      waveglow_nvidia_repo_dir, waveglow_path, fp16)
+                avg_metric = validate(model, val_loader, writer, iteration, waveglow_path, fp16)
                 if epoch % infer_every:
                     inference(model, Path("sample_phrases.txt").read_text().split("\n"),
-                              writer, iteration, waveglow_nvidia_repo_dir, waveglow_path, fp16)
+                              writer, iteration, waveglow_path, fp16)
                 if avg_metric < best_metric:
                     # TODO: save last n checkpoints in terms of target metric
                     best_metric = avg_metric

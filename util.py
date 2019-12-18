@@ -38,7 +38,7 @@ def show_figure(
     Keep in mind that for attention you should use origin=lower keyword arg
     from lower left angle to upper right"""
     fig, ax = plt.subplots()
-    im = ax.imshow(image, aspect='auto', interpolation='none', **kwargs)
+    im = ax.imshow(image, aspect='auto', **kwargs)
     fig.colorbar(im, ax=ax)
     fig.canvas.draw()
     # save it to a numpy array.
