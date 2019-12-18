@@ -142,7 +142,7 @@ class Decoder(nn.Module):
 
         self.decoder_n_layers = 2
         self.decoder_rnn = nn.LSTM(prenet_dim + attention_context_size, hidden_size,
-                                   num_layers=self.decoder_n_layers, batch_first=True, dropout=p_dropout)
+                                   num_layers=self.decoder_n_layers, batch_first=True, dropout=0.1)
 
         self.linear_target = nn.Linear(hidden_size + attention_context_size, self.mel_channels)
         self.linear_stop_pred = nn.Linear(hidden_size + attention_context_size, 1)
