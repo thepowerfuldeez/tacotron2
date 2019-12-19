@@ -71,8 +71,10 @@ class Attention(nn.Module):
         mask = encoder_outputs.sum(-1) == 0
         decoder_input = self.prenet_projection(decoder_input)
         hidden = self.hidden_projection(hidden)
+        attention_input = decoder_input + hidden
+        attention_input = F.dropout(attention_input, 0.2, self.training)
 
-        energies = self.attention_linear(torch.tanh(decoder_input + hidden))
+        energies = self.attention_linear(torch.tanh(attention_input))
         # fill masked values with -inf to get exact zero after softmax
         energies = energies[:, :encoder_outputs.size(1)].masked_fill(mask, float('-inf'))
 
@@ -157,7 +159,7 @@ class Decoder(nn.Module):
 
         self.decoder_n_layers = 2
         self.decoder_rnn = nn.LSTM(prenet_dim + attention_context_size, hidden_size,
-                                   num_layers=self.decoder_n_layers, batch_first=True, dropout=0.1)
+                                   num_layers=self.decoder_n_layers, batch_first=True, dropout=0.2)
 
         self.linear_target = nn.Linear(hidden_size + attention_context_size, self.mel_channels)
         self.linear_stop_pred = nn.Linear(hidden_size + attention_context_size, 1)
